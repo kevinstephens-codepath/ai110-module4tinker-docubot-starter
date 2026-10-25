@@ -9,6 +9,16 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import math
+import re
+from collections import Counter
+
+# Shown whenever the docs do not contain enough evidence to answer
+REFUSAL_MESSAGE = "I do not know based on the docs I have."
+
+# Fraction of the query's (rarity-weighted) terms a snippet must cover to count as evidence
+MIN_TERM_COVERAGE = 0.5
+
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -22,8 +32,12 @@ class DocuBot:
         # Load documents into memory
         self.documents = self.load_documents()  # List of (filename, text)
 
-        # Build a retrieval index (implemented in Phase 1)
-        self.index = self.build_index(self.documents)
+        # Split documents into small snippets so retrieval returns only
+        # the relevant parts instead of whole files
+        self.chunks = self.chunk_documents(self.documents)  # List of (filename, snippet)
+
+        # Build a retrieval index over the snippets (implemented in Phase 1)
+        self.index = self.build_index(self.chunks)
 
     # -----------------------------------------------------------
     # Document Loading
@@ -45,27 +59,68 @@ class DocuBot:
         return docs
 
     # -----------------------------------------------------------
+    # Chunking
+    # -----------------------------------------------------------
+
+    def chunk_documents(self, documents):
+        """
+        Splits each document into paragraph-sized snippets.
+        Every snippet is prefixed with its heading trail (e.g. "# Database
+        Guide > ## Tables > ### users") so it keeps the context of the section
+        it came from, even when it is the 2nd or 3rd block under a heading.
+        Returns a list of (filename, snippet).
+        """
+        chunks = []
+        for filename, text in documents:
+            trail = []  # [(level, heading line)]
+            for block in re.split(r"\n\s*\n", text):
+                block = block.strip()
+                if not block:
+                    continue
+                if block.startswith("#") and "\n" not in block:
+                    level = len(block) - len(block.lstrip("#"))
+                    trail = [h for h in trail if h[0] < level] + [(level, block)]
+                    continue
+                prefix = " > ".join(h for _, h in trail)
+                snippet = f"{prefix}\n\n{block}" if prefix else block
+                chunks.append((filename, snippet))
+        return chunks
+
+    # -----------------------------------------------------------
     # Index Construction (Phase 1)
     # -----------------------------------------------------------
 
-    def build_index(self, documents):
+    def build_index(self, chunks):
         """
-        TODO (Phase 1):
-        Build a tiny inverted index mapping lowercase words to the documents
-        they appear in.
+        Build a tiny inverted index mapping lowercase words to the ids
+        (positions in self.chunks) of the snippets they appear in.
 
         Example structure:
         {
-            "token": ["AUTH.md", "API_REFERENCE.md"],
-            "database": ["DATABASE.md"]
+            "token": [0, 4, 17],
+            "database": [23]
         }
 
         Keep this simple: split on whitespace, lowercase tokens,
         ignore punctuation if needed.
         """
         index = {}
-        # TODO: implement simple indexing
+        for chunk_id, (_, text) in enumerate(chunks):
+            for word in set(self._tokenize(text)):
+                index.setdefault(word, []).append(chunk_id)
         return index
+
+    _STOPWORDS = {
+        "a", "an", "the", "is", "are", "of", "to", "in", "on", "for", "and",
+        "or", "how", "what", "where", "which", "do", "does", "i", "it", "we",
+        "with", "from", "by", "at", "as", "be", "can", "this", "that", "my",
+        "you", "there", "any", "if", "was", "were", "me", "about",
+    }
+
+    def _tokenize(self, text):
+        """Lowercase, strip punctuation, drop stopwords."""
+        words = re.findall(r"[a-z0-9_]+", text.lower())
+        return [w for w in words if w not in self._STOPWORDS]
 
     # -----------------------------------------------------------
     # Scoring and Retrieval (Phase 1)
@@ -81,19 +136,52 @@ class DocuBot:
         - Count how many appear in the text
         - Return the count as the score
         """
-        # TODO: implement scoring
-        return 0
+        counts = Counter(self._tokenize(text))
+        return sum(counts[word] for word in set(self._tokenize(query)))
+
+    def _term_weight(self, term):
+        """
+        Inverse document frequency over snippets: words found in few snippets
+        weigh more. A word missing from the docs entirely gets the max weight,
+        since the user is asking about something we have no evidence for.
+        """
+        doc_freq = len(self.index.get(term, []))
+        return math.log((len(self.chunks) + 1) / (doc_freq + 1)) + 1
 
     def retrieve(self, query, top_k=3):
         """
         TODO (Phase 1):
-        Use the index and scoring function to select top_k relevant document snippets.
+        Use the index and scoring function to select the top_k most relevant snippets.
 
         Return a list of (filename, text) sorted by score descending.
         """
-        results = []
-        # TODO: implement retrieval logic
-        return results[:top_k]
+        # Only score snippets that contain at least one query word
+        candidates = set()
+        for word in set(self._tokenize(query)):
+            candidates.update(self.index.get(word, []))
+
+        query_terms = set(self._tokenize(query))
+        weights = {term: self._term_weight(term) for term in query_terms}
+        total_weight = sum(weights.values())
+
+        # Require evidence: a snippet must cover at least half of the query's
+        # total term weight. Rare/unknown words ("pancake") weigh a lot and
+        # common words ("make") weigh little, so one incidental shared word
+        # is not enough, while a short query like "database connection" still
+        # matches snippets about it.
+        scored = []
+        for chunk_id in candidates:
+            filename, text = self.chunks[chunk_id]
+            matched = query_terms & set(self._tokenize(text))
+            if sum(weights[t] for t in matched) < total_weight * MIN_TERM_COVERAGE:
+                continue
+            score = self.score_document(query, text)
+            if score > 0:
+                scored.append((score, chunk_id, filename, text))
+
+        # Highest score first; ties keep document order
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [(filename, text) for _, _, filename, text in scored[:top_k]]
 
     # -----------------------------------------------------------
     # Answering Modes
@@ -107,7 +195,7 @@ class DocuBot:
         snippets = self.retrieve(query, top_k=top_k)
 
         if not snippets:
-            return "I do not know based on these docs."
+            return REFUSAL_MESSAGE
 
         formatted = []
         for filename, text in snippets:
@@ -129,7 +217,7 @@ class DocuBot:
         snippets = self.retrieve(query, top_k=top_k)
 
         if not snippets:
-            return "I do not know based on these docs."
+            return REFUSAL_MESSAGE
 
         return self.llm_client.answer_from_snippets(query, snippets)
 
